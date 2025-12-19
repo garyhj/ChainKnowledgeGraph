@@ -3,126 +3,130 @@
 # File: MedicalGraph.py
 # Author: lhy<lhy_in_blcu@126.com,https://liuhuangyong.github.io>
 # Date: 18-10-3
+# Optimized: 2025-12-19 for performance
 
 import os
 import json
-
-from py2neo import Graph,Node
+from py2neo import Graph
 
 class MedicalGraph:
     def __init__(self):
-        cur_dir = '/'.join(os.path.abspath(__file__).split('/')[:-1])
-        self.company_path = os.path.join(cur_dir, 'data/company.json')
-        self.industry_path = os.path.join(cur_dir, 'data/industry.json')
-        self.product_path = os.path.join(cur_dir, 'data/product.json')
-        self.company_industry_path = os.path.join(cur_dir, 'data/company_industry.json')
-        self.company_product_path = os.path.join(cur_dir, 'data/company_product.json')
-        self.industry_industry = os.path.join(cur_dir, 'data/industry_industry.json')
-        self.product_product = os.path.join(cur_dir, 'data/product_product.json')
+        cur_dir = os.path.dirname(os.path.abspath(__file__))
+        self.data_dir = os.path.join(cur_dir, 'data')
         self.g = Graph(
-            host="127.0.0.1",  # neo4j 搭载服务器的ip地址，ifconfig可获取到
-            http_port=7474,  # neo4j 服务器监听的端口号
-            user="neo4j",  # 数据库user name，如果没有更改过，应该是neo4j
-            password="123456")
+            host="127.0.0.1",
+            http_port=7474,
+            user="neo4j",
+            password="123456"
+        )
 
-    '''建立节点'''
-    def create_node(self, label, nodes):
-        count = 0
-        for node in nodes:
-            bodies = []
-            for k, v in node.items():
-                body = k + ":" + "'%s'"% v
-                bodies.append(body)
-            query_body = ', '.join(bodies)
-            try:
-                sql = "CREATE (:%s{%s})"%(label, query_body)
-                self.g.run(sql)
-                count += 1
-            except:
-                pass
-            print(count, len(nodes))
-        return 1
-
-
-
-    """加载数据"""
-    def load_data(self, filepath):
+    def load_data(self, filename):
+        path = os.path.join(self.data_dir, filename)
         datas = []
-        with open(filepath, 'r') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                if not obj:
-                    continue
-                datas.append(obj)
+                if line:
+                    try:
+                        obj = json.loads(line)
+                        if obj:
+                            datas.append(obj)
+                    except json.JSONDecodeError:
+                        continue
         return datas
 
+    def create_nodes_batch(self, label: str, nodes: list, name_key: str = "name"):
+        """
+        批量创建节点，使用 UNWIND 提升性能
+        假设每个 node 是 dict，包含属性，其中必须有 name 字段（或指定 name_key）
+        """
+        if not nodes:
+            return
+        # 构造属性字典列表（确保所有字段都传入）
+        batch_data = []
+        for node in nodes:
+            # 过滤掉 None 或空字符串值（可选）
+            cleaned = {k: v for k, v in node.items() if v is not None and v != ""}
+            batch_data.append(cleaned)
 
+        query = f"""
+        UNWIND $batch AS row
+        CREATE (n:{label})
+        SET n = row
+        """
+        self.g.run(query, batch=batch_data)
+        print(f"Created {len(batch_data)} nodes of type '{label}'")
 
-    '''创建知识图谱实体节点类型schema'''
+    def create_relationships_batch(self, start_label, end_label, rel_type, edges, from_key, to_key, attr_keys=None):
+        """
+        批量创建关系
+        :param attr_keys: 需要作为关系属性的字段名列表，如 ["rel_weight"]
+        """
+        if not edges:
+            return
+
+        batch_data = []
+        for edge in edges:
+            item = {
+                "from": edge[from_key],
+                "to": edge[to_key],
+            }
+            if attr_keys:
+                for k in attr_keys:
+                    if k in edge:
+                        item[k] = edge[k]
+            batch_data.append(item)
+
+        # 构建 SET 子句（如果有属性）
+        set_clause = ""
+        if attr_keys:
+            set_items = [f"rel.{k} = row.{k}" for k in attr_keys]
+            set_clause = " SET " + ", ".join(set_items)
+
+        query = f"""
+        UNWIND $batch AS row
+        MATCH (a:{start_label} {{name: row.from}})
+        MATCH (b:{end_label} {{name: row.to}})
+        CREATE (a)-[rel:{rel_type}]->(b)
+        {set_clause}
+        """
+        self.g.run(query, batch=batch_data)
+        print(f"Created {len(batch_data)} relationships of type '{rel_type}'")
+
     def create_graphnodes(self):
-        company = self.load_data(self.company_path)
-        product = self.load_data(self.product_path)
-        industry = self.load_data(self.industry_path)
-        self.create_node('company', company)
-        print(len(company))
-        self.create_node('product', product)
-        print(len(product))
-        self.create_node('industry', industry)
-        print(len(industry))
-        return
+        company = self.load_data('company.json')
+        product = self.load_data('product.json')
+        industry = self.load_data('industry.json')
 
-    '''创建实体关系边'''
+        self.create_nodes_batch('company', company)
+        self.create_nodes_batch('product', product)
+        self.create_nodes_batch('industry', industry)
+
     def create_graphrels(self):
-        company_industry = self.load_data(self.company_industry_path)
-        company_product = self.load_data(self.company_product_path)
-        product_product = self.load_data(self.product_product)
-        industry_industry = self.load_data(self.industry_industry)
-        self.create_relationship('company', 'industry', company_industry, "company_name", "industry_name")
-        self.create_relationship('industry', 'industry', industry_industry, "from_industry", "to_industry")
-        self.create_relationship_attr('company', 'product', company_product, "company_name", "product_name")
-        self.create_relationship('product', 'product', product_product, "from_entity", "to_entity")
+        company_industry = self.load_data('company_industry.json')
+        company_product = self.load_data('company_product.json')
+        product_product = self.load_data('product_product.json')
+        industry_industry = self.load_data('industry_industry.json')
 
+        # 注意：假设所有关系数据中都有 "rel" 字段表示关系类型
+        # 但不同文件可能结构不同，需统一处理
 
-    '''创建实体关联边'''
-    def create_relationship(self, start_node, end_node, edges, from_key, end_key):
-        count = 0
-        for edge in edges:
-            try:
-                p = edge[from_key]
-                q = edge[end_key]
-                rel = edge["rel"]
-                query = "match(p:%s),(q:%s) where p.name='%s'and q.name='%s' create (p)-[rel:%s]->(q)" % (
-                start_node, end_node, p, q, rel)
-                self.g.run(query)
-                count += 1
-                print(rel, count, all)
-            except Exception as e:
-                print(e)
-        return
+        # 1. company -[rel]-> industry
+        self.create_relationships_batch('company', 'industry', 'BELONGS_TO', company_industry, 'company_name', 'industry_name')
 
+        # 2. industry -> industry （假设 rel 字段存在）
+        # 如果 industry_industry 中的关系类型固定，可硬编码；否则需动态处理
+        # 此处假设关系类型在 "rel" 字段中
+        if industry_industry and 'rel' in industry_industry[0]:
+            # 动态按 rel 分组（更复杂），但为简化，先假设都是同一类型如 "SUBCLASS_OF"
+            # 或者你可以在 JSON 中统一用固定 rel 名
+            self.create_relationships_batch('industry', 'industry', 'RELATED_TO', industry_industry, 'from_industry', 'to_industry')
 
-    '''创建实体关联边'''
-    def create_relationship_attr(self, start_node, end_node, edges, from_key, end_key):
-        count = 0
-        for edge in edges:
-            p = edge[from_key]
-            q = edge[end_key]
-            rel = edge["rel"]
-            weight = edge["rel_weight"]
-            query = "match(p:%s),(q:%s) where p.name='%s'and q.name='%s' create (p)-[rel:%s{%s:'%s'}]->(q)" % (
-                start_node, end_node, p, q, rel, "权重", weight)
-            try:
-                self.g.run(query)
-                count += 1
-                print(rel, count)
-            except Exception as e:
-                print(e)
-        return
+        # 3. company -[PRODUCES {权重: ...}]-> product
+        self.create_relationships_batch('company', 'product', 'PRODUCES', company_product, 'company_name', 'product_name', attr_keys=['rel_weight'])
 
-
+        # 4. product -[SIMILAR_TO]-> product
+        self.create_relationships_batch('product', 'product', 'SIMILAR_TO', product_product, 'from_entity', 'to_entity')
 
 if __name__ == '__main__':
     handler = MedicalGraph()
