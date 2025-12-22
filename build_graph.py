@@ -35,6 +35,29 @@ class MedicalGraph:
                         continue
         return datas
 
+    def ensure_index_and_constraint(self, label: str):
+        """为 label 的 name 属性创建唯一性约束（自动包含索引）"""
+        try:
+            # 先尝试创建唯一性约束（Neo4j 5+ 推荐方式）
+            self.g.run(f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.name IS UNIQUE")
+            print(f"✅ Constraint (and index) created for {label}.name")
+        except Exception as e:
+            # 如果不支持约束（如旧版），退化为创建索引
+            print(f"Constraint failed for {label}, falling back to index: {e}")
+            try:
+                self.g.run(f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.name)")
+                print(f"✅ Index created for {label}.name")
+            except Exception as e2:
+                print(f"Index also failed for {label}: {e2}")
+
+
+    def create_indexes_and_constraints(self):
+        print("🔍 Creating indexes and constraints...")
+        self.ensure_index_and_constraint('company')
+        self.ensure_index_and_constraint('product')
+        self.ensure_index_and_constraint('industry')
+
+    
     def create_nodes_batch(self, label: str, nodes: list, name_key: str = "name"):
         """
         批量创建节点，使用 UNWIND 提升性能
@@ -57,78 +80,77 @@ class MedicalGraph:
         self.g.run(query, batch=batch_data)
         print(f"Created {len(batch_data)} nodes of type '{label}'")
 
-    def create_relationships_batch(self, start_label, end_label, rel_type, edges, from_key, to_key, attr_keys=None):
+    def create_graphnodes(self):
+        company = self.load_data('company.json')
+        product = self.load_data('product.json')
+        industry = self.load_data('industry.json')
+        self.create_nodes_batch('company', company)
+        self.create_nodes_batch('product', product)
+        self.create_nodes_batch('industry', industry)
+
+
+    def create_relationships_dynamic(self, start_label, end_label, edges, from_key, to_key, attr_keys=None):
         """
-        批量创建关系
-        :param attr_keys: 需要作为关系属性的字段名列表，如 ["rel_weight"]
+        动态按 edge['rel'] 分组，批量创建不同关系类型
         """
         if not edges:
             return
 
-        batch_data = []
+        rel_groups = defaultdict(list)
         for edge in edges:
+            rel_type = edge.get("rel")
+            if not rel_type or from_key not in edge or to_key not in edge:
+                continue
             item = {
-                "from": edge[from_key],
-                "to": edge[to_key],
+                "from": str(edge[from_key]),
+                "to": str(edge[to_key]),
             }
             if attr_keys:
                 for k in attr_keys:
                     if k in edge:
                         item[k] = edge[k]
-            batch_data.append(item)
+            rel_groups[rel_type].append(item)
 
-        # 构建 SET 子句（如果有属性）
-        set_clause = ""
-        if attr_keys:
-            set_items = [f"rel.{k} = row.{k}" for k in attr_keys]
-            set_clause = " SET " + ", ".join(set_items)
+        for rel_type, batch in rel_groups.items():
+            # 构建关系属性 SET 子句
+            set_clause = ""
+            if attr_keys:
+                existing_attrs = set()
+                for item in batch:
+                    existing_attrs.update(k for k in attr_keys if k in item)
+                if existing_attrs:
+                    set_items = [f"rel.{k} = row.{k}" for k in existing_attrs]
+                    set_clause = " SET " + ", ".join(set_items)
 
-        query = f"""
-        UNWIND $batch AS row
-        MATCH (a:{start_label} {{name: row.from}})
-        MATCH (b:{end_label} {{name: row.to}})
-        CREATE (a)-[rel:{rel_type}]->(b)
-        {set_clause}
-        """
-        self.g.run(query, batch=batch_data)
-        print(f"Created {len(batch_data)} relationships of type '{rel_type}'")
-
-    def create_graphnodes(self):
-        company = self.load_data('company.json')
-        product = self.load_data('product.json')
-        industry = self.load_data('industry.json')
-
-        self.create_nodes_batch('company', company)
-        self.create_nodes_batch('product', product)
-        self.create_nodes_batch('industry', industry)
+            # 注意：关系类型用反引号包裹，支持含空格/特殊字符
+            query = f"""
+            UNWIND $batch AS row
+            MATCH (a:{start_label} {{name: row.from}})
+            MATCH (b:{end_label} {{name: row.to}})
+            CREATE (a)-[rel:`{rel_type}`]->(b)
+            {set_clause}
+            """
+            try:
+                self.g.run(query, batch=batch)
+                print(f"✅ Created {len(batch)} relationships of type `{rel_type}` "
+                      f"from {start_label} to {end_label}")
+            except Exception as e:
+                print(f"❌ Failed to create relationship `{rel_type}`: {e}")
 
     def create_graphrels(self):
+        print("🔗 Loading relationship data...")
         company_industry = self.load_data('company_industry.json')
         company_product = self.load_data('company_product.json')
         product_product = self.load_data('product_product.json')
         industry_industry = self.load_data('industry_industry.json')
-
-        # 注意：假设所有关系数据中都有 "rel" 字段表示关系类型
-        # 但不同文件可能结构不同，需统一处理
-
-        # 1. company -[rel]-> industry
-        self.create_relationships_batch('company', 'industry', 'BELONGS_TO', company_industry, 'company_name', 'industry_name')
-
-        # 2. industry -> industry （假设 rel 字段存在）
-        # 如果 industry_industry 中的关系类型固定，可硬编码；否则需动态处理
-        # 此处假设关系类型在 "rel" 字段中
-        if industry_industry and 'rel' in industry_industry[0]:
-            # 动态按 rel 分组（更复杂），但为简化，先假设都是同一类型如 "SUBCLASS_OF"
-            # 或者你可以在 JSON 中统一用固定 rel 名
-            self.create_relationships_batch('industry', 'industry', 'RELATED_TO', industry_industry, 'from_industry', 'to_industry')
-
-        # 3. company -[PRODUCES {权重: ...}]-> product
-        self.create_relationships_batch('company', 'product', 'PRODUCES', company_product, 'company_name', 'product_name', attr_keys=['rel_weight'])
-
-        # 4. product -[SIMILAR_TO]-> product
-        self.create_relationships_batch('product', 'product', 'SIMILAR_TO', product_product, 'from_entity', 'to_entity')
+        print("⚡ Creating relationships...")
+        self.create_relationships_dynamic('company', 'industry', company_industry, 'company_name', 'industry_name')
+        self.create_relationships_dynamic('industry', 'industry', industry_industry, 'from_industry', 'to_industry')
+        self.create_relationships_dynamic('company', 'product', company_product, 'company_name', 'product_name', attr_keys=['rel_weight'])
+        self.create_relationships_dynamic('product', 'product', product_product, 'from_entity', 'to_entity')
 
 if __name__ == '__main__':
     handler = MedicalGraph()
     handler.create_graphnodes()
+    handler.create_indexes_and_constraints()  
     handler.create_graphrels()
